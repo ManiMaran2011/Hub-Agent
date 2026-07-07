@@ -32,42 +32,73 @@ rather than staged upfront.
    handling, seemed like a better use of the time budget than breadth
    across more surface area.
 
+Before any of this touched a live deployment, Claude's own sandbox couldn't
+reach Prisma's binary CDN to run `prisma generate`, so it hand-built a
+throwaway type stub matching the real schema to get a genuine `tsc`
+pass rather than skipping verification — that caught two `undefined`-safety
+bugs in `lib/github/actions.ts` before they ever shipped. Useful, but a
+different category of finding than the two below, which only showed up
+once real traffic hit the real deployment.
+
 ## The hardest thing that came up
 
-Not a wrong turn in the usual "AI hallucinated an API" sense — the actual
-hardest moment was that Claude's own sandbox couldn't reach
-`binaries.prisma.sh` (blocked by the sandbox's network allowlist), so
-`prisma generate` failed outright and most of the codebase — anything
-touching `@prisma/client` types — couldn't be type-checked normally.
+Two real issues surfaced, and both only showed up once the app was actually
+deployed and used against real GitHub/Slack/Gemini traffic — neither was
+visible from reading the code, which is itself the point of end-to-end
+testing rather than stopping at "it type-checks."
 
-The easy failure mode there is to just eyeball the Prisma-dependent code
-and assume it's fine. Instead, Claude hand-wrote a throwaway `.d.ts` stub
-matching the real generated shapes (the enums and model fields from
-`schema.prisma`) and dropped it into `node_modules/.prisma/client/` to get
-`tsc --noEmit` running for real against the actual application code, then
-deleted the stub once it had served its purpose. That run caught two real
-bugs: `owner`/`repo` from `fullName.split("/")` are typed as
-`string | undefined` in strict TypeScript, and the code passed them
-straight to Octokit's typed methods, which expect `string`. Harmless on
-almost every real repo full name, but a legitimate crash if a repository
-name were ever malformed — worth fixing rather than silencing with a cast.
-I only know this happened because the transcript shows the failed
-install, the stub, the two errors, and the fix — not because I re-derived
-it after the fact.
+**1. A self-inflicted feedback loop.** `normalize.ts` originally treated
+`issues.labeled` as an "actionable" trigger, same as `opened`/`edited`.
+That seemed reasonable in isolation. In practice: the bot's own
+`addLabel` call, once it succeeds, causes GitHub to fire a *second*,
+distinct webhook (`issues.labeled`) for the label it just added. That
+event matched the same rule again ("title contains bug" — the title
+hadn't changed) and re-ran every action. The label add itself was
+harmless (idempotent — already-present labels are skipped), but Slack
+got hit twice per issue. This is not the "delivery redelivered" case the
+idempotency logic already covers — it was two *different*, legitimate
+delivery IDs, so the unique-constraint guard correctly let both through.
+The actual bug was scope: a bot should never treat its own write-back as
+a fresh trigger. Fix: dropped `"labeled"` from the actionable-actions
+list, and added a second, general guard in the webhook route that skips
+any event where `sender.type === "Bot"`, as a backstop for whatever event
+type gets added next.
 
-The honest caveat: I have not run this against a live GitHub App,
-Slack workspace, or Neon database end-to-end, because doing so requires
-accounts and secrets that only I can create. What's verified is that it
-type-checks cleanly against Prisma's real generated types, lints clean,
-and every module's logic (signature verification, idempotency via the
-unique `deliveryId` constraint, the retry/backoff schedule, the rules
-engine's matching semantics) was reasoned through explicitly rather than
-assumed. The remaining risk is entirely in the "did I configure the
-GitHub App's permissions/webhook events exactly right" category, which
-the README's setup walkthrough is written to minimize.
+**2. Gemini 1.5 was fully retired.** AI triage was wired up to
+`gemini-1.5-flash` and passed every check I could run without a live key
+— schema validation, error handling, the works. It still didn't work in
+production: Google shut down all Gemini 1.0 and 1.5 models earlier this
+year, so every call 404'd. The code's own fail-safe design is what made
+this a non-event instead of an outage — the failure was caught, logged
+with the real error, and the rest of the pipeline (label, Slack)
+completed normally with AI triage simply absent. We only found the exact
+cause by reading Vercel's runtime logs rather than guessing, which
+surfaced the literal 404 and a later transient 503 ("high demand") from
+Google's side — a genuinely different, temporary failure that resolved
+on retry. Fixed by moving to `gemini-2.5-flash`, the current stable
+model as of this deployment.
+
+Both bugs share a lesson: a system that fails loudly and specifically (structured
+logs with the real error, not a generic "something went wrong") turns a
+silent gap into a two-minute diagnosis. The parts of this build that paid
+off hardest under real testing were the ones designed for failure to be
+visible, not the ones designed to avoid failure entirely.
+
+The honest caveat that remains: this was tested against one repository,
+one Slack workspace, and a handful of manually-created issues/PRs — not
+load, not concurrency, not an organization's real webhook volume. What's
+verified is the *shape* of the reliability story (idempotency, retries,
+partial failure, graceful AI degradation), each demonstrated at least
+once against the real live deployment, not simulated.
 
 ## What I'd improve with more time
 
+- A single retry-with-backoff around the Gemini call itself for transient
+  errors (503 "high demand," specifically — seen once during live
+  testing, resolved on the next attempt with no code change). Right now
+  a transient AI provider hiccup just means that one event's triage is
+  silently skipped rather than retried a few seconds later, even though
+  the rest of the retry infrastructure already exists for GitHub/Slack.
 - OR-groups in the rules engine (currently AND-only across conditions).
 - A second notification channel (Telegram, per the suggested services)
   behind the same `RuleAction` union, to prove the action model
