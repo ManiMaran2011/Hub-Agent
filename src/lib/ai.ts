@@ -46,7 +46,7 @@ export async function runAiTriage(event: NormalizedEvent): Promise<AiTriageResul
   try {
     const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY as string);
     const model = genAI.getGenerativeModel({
-      model: "gemini-1.5-flash",
+      model: "gemini-2.5-flash",
       systemInstruction: SYSTEM_INSTRUCTION,
       generationConfig: {
         responseMimeType: "application/json",
