@@ -1,0 +1,167 @@
+// GHOps Bot — data model
+//
+// Design notes (see AI_NOTES.md and README.md for the full rationale):
+// - `Event.deliveryId` is unique -> this is what makes webhook processing
+//   idempotent. GitHub redelivers events on timeout/error; a redelivery
+//   upserts onto the same row instead of creating a duplicate / re-firing
+//   actions.
+// - `Event.status` + `retryCount` + `nextRetryAt` model a durable queue
+//   without needing a separate message broker: the cron worker
+//   (`/api/cron/retry`) sweeps rows that are `pending`/`failed` and due.
+// - `ActionLog` is one row per side-effect (label added, comment posted,
+//   Slack message sent) so the dashboard can show exactly what happened,
+//   and so a partially-failed event (e.g. label succeeded, Slack failed)
+//   can retry only the failed half.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_URL_UNPOOLED")
+}
+
+enum EventStatus {
+  pending // persisted, not yet processed
+  processing // currently being worked (claimed by a worker run)
+  success // all actions completed
+  partial // some actions succeeded, some failed
+  failed // all attempted actions failed, eligible for retry
+  ignored // received, matched no rules, nothing to do
+}
+
+enum ActionType {
+  add_label
+  comment
+  slack_notify
+}
+
+enum ActionStatus {
+  pending
+  success
+  failed
+}
+
+model User {
+  id          String   @id @default(cuid())
+  githubId    Int      @unique
+  login       String
+  name        String?
+  avatarUrl   String?
+  email       String?
+  accessToken String? // encrypted at rest is out of scope for the exercise; documented in README
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  installations Installation[]
+  rules         Rule[]
+
+  @@index([login])
+}
+
+model Installation {
+  id                   String   @id @default(cuid())
+  githubInstallationId Int      @unique
+  accountLogin         String
+  accountType          String // "User" | "Organization"
+  targetType           String // mirrors GitHub's `target_type`
+  suspended            Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  repositories Repository[]
+
+  @@index([userId])
+}
+
+model Repository {
+  id             String   @id @default(cuid())
+  githubRepoId   Int      @unique
+  name           String
+  fullName       String // "owner/repo"
+  defaultBranch  String   @default("main")
+  private        Boolean  @default(false)
+  htmlUrl        String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  installationId String
+  installation   Installation @relation(fields: [installationId], references: [id], onDelete: Cascade)
+
+  rules  Rule[]
+  events Event[]
+
+  @@index([installationId])
+  @@index([fullName])
+}
+
+model Rule {
+  id        String   @id @default(cuid())
+  name      String
+  eventType String // "issues" | "pull_request" | "push" | "any"
+  // conditions: [{ field: "title"|"body"|"author"|"label"|"branch", op: "contains"|"equals"|"startsWith", value: string, caseSensitive?: bool }]
+  conditions Json
+  // actions: [{ type: "add_label", label }] | [{ type: "comment", template }] | [{ type: "slack_notify", template, channel? }]
+  actions   Json
+  enabled   Boolean  @default(true)
+  priority  Int      @default(100) // lower runs first
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // null = applies to every repository the user has connected
+  repositoryId String?
+  repository   Repository? @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([repositoryId])
+}
+
+model Event {
+  id           String      @id @default(cuid())
+  deliveryId   String      @unique // GitHub's X-GitHub-Delivery header
+  eventType    String // "issues" | "pull_request" | "push" | ...
+  action       String? // GitHub's payload.action, e.g. "opened"
+  status       EventStatus @default(pending)
+  payload      Json // trimmed payload, only fields we act on — see lib/github/normalize.ts
+  matchedRules Json? // ids + names of rules that matched, for observability
+  aiTriage     Json? // { summary, suggestedLabels, priority, reasoning } | null
+  retryCount   Int         @default(0)
+  nextRetryAt  DateTime?
+  lastError    String?
+  receivedAt   DateTime    @default(now())
+  processedAt  DateTime?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  repositoryId String?
+  repository   Repository? @relation(fields: [repositoryId], references: [id], onDelete: SetNull)
+
+  actionLogs ActionLog[]
+
+  @@index([repositoryId, createdAt])
+  @@index([status, nextRetryAt])
+}
+
+model ActionLog {
+  id        String       @id @default(cuid())
+  type      ActionType
+  status    ActionStatus @default(pending)
+  detail    Json // e.g. { label: "bug" } or { channel: "#repo-events", messageTs }
+  error     String?
+  attempts  Int          @default(0)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  eventId String
+  event   Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+}
