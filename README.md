@@ -5,8 +5,8 @@ according to rules you configure, writes back to GitHub (labels,
 comments), pings Slack, and optionally triages issues/PRs with Gemini —
 all visible on a live dashboard behind GitHub login.
 
-**Live app:** _add your deployed URL here before submitting_
-**Repo:** _add your repo URL here before submitting_
+**Live app:** https://ghops-bot.vercel.app
+**Repo:** https://github.com/ManiMaran2011/Hub-Agent
 
 ---
 
