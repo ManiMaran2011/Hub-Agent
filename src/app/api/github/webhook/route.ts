@@ -73,6 +73,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ ok: true, message: "event type not handled" });
   }
 
+if (payload.sender?.type === "Bot") {
+    logger.info("webhook_ignored_bot_sender", { eventType, deliveryId, sender: payload.sender?.login });
+    return NextResponse.json({ ok: true, message: "ignoring event triggered by a bot" });
+  }
+    
   const installationId: number | undefined = payload.installation?.id;
   if (!installationId) {
     return NextResponse.json({ error: "payload missing installation id" }, { status: 400 });

@@ -41,7 +41,7 @@ export function normalizeGithubEvent(
   };
 
   if (eventType === "issues") {
-    const actionable = ["opened", "edited", "reopened", "labeled"];
+    const actionable = ["opened", "edited", "reopened"];
     if (!actionable.includes(payload.action)) return null;
     const issue = payload.issue;
     return {
